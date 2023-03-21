@@ -18,7 +18,7 @@ pub struct AuxiliaryEntry {
 
 const AT_SYSINFO_EHDR: u64 = 33; // x86-64
 const SECCOMP_SET_MODE_FILTER: c_uint = 1;
-const PTRACE_GET_SYSCALL_INFO: i32 = 0x420e;
+const PTRACE_GET_SYSCALL_INFO: u32 = 0x420e;
 
 #[repr(C)]
 #[derive(Clone, Copy)]

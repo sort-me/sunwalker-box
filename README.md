@@ -20,13 +20,22 @@ Finally, sandboxes seldom prioritize efficiency. We can do much better than recr
 
 ## Building
 
+### 🐳 With Docker (recommended)
+
+The only thing you need to have installed is Docker. After run, `sunwalker_box` X86_64 binary appears in root folder.
+```shell
+$ make docker-build
+```
+
+The executable is statically linked, so it can be copied to any Linux machine and run without requiring any additional libraries or dependencies.
+
+### Manually
+
 Install rustc nightly, `nasm`, `ld`, and `gem install seccomp-tools`, and use
 
 ```shell
-$ make
+$ make sunwalker_box
 ```
-
-This generates a `sunwalker_box` executable in the current directory. The executable is statically linked and relatively small (around a megabyte, and smaller in compressed form), so it can be copied to any Linux machine and run without requiring any additional libraries or dependencies.
 
 
 ## Using
