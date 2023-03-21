@@ -18,6 +18,6 @@ COPY /src /build/src
 
 COPY Makefile /build/Makefile
 
-RUN make sunwalker_box
+RUN make sunwalker-box
 
 RUN :

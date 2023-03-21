@@ -1,3 +1,7 @@
+.PHONY: docker-build
+
+all: docker-build
+
 docker-build:
 	# run docker and copy file from it
 	docker build -t sunwalker-box .
