@@ -34,7 +34,7 @@ The executable is statically linked, so it can be copied to any Linux machine an
 Install rustc nightly, `nasm`, `ld`, and `gem install seccomp-tools`, and use
 
 ```shell
-$ make sunwalker_box
+$ make sunwalker-box
 ```
 
 
