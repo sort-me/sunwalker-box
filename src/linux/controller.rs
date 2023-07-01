@@ -3,7 +3,12 @@ use crate::{
     linux::{cgroups, manager, mountns, procs, reaper, rootfs, sandbox, system},
 };
 use anyhow::{anyhow, bail, Context, Result};
-use nix::{libc, libc::SYS_pidfd_open, sys::{signal, resource}, unistd::Pid};
+use nix::{
+    libc,
+    libc::SYS_pidfd_open,
+    sys::{resource, signal},
+    unistd::Pid,
+};
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -29,7 +34,8 @@ impl Controller {
 
         // Core dumps are dangerous if the box dumps in a user-controlled directory. They are incur
         // a penalty on runtime errors.
-        resource::setrlimit(resource::Resource::RLIMIT_CORE, 0, 0).context("Failed to disable core dumps")?;
+        resource::setrlimit(resource::Resource::RLIMIT_CORE, 0, 0)
+            .context("Failed to disable core dumps")?;
 
         Ok(Self {
             quotas,
@@ -74,8 +80,10 @@ impl Controller {
         // Setup rootfs
         let mut root_cur = PathBuf::from("/oldroot");
         root_cur.extend(root.strip_prefix("/"));
-        self.rootfs_state =
-            Some(rootfs::create_rootfs(&root_cur).context("Failed to create rootfs")?);
+        self.rootfs_state = Some(
+            rootfs::create_rootfs(&root_cur, self.quotas.clone())
+                .context("Failed to create rootfs")?,
+        );
 
         Ok(())
     }
@@ -156,21 +164,26 @@ impl Controller {
 
     pub fn reset(&mut self) -> Result<()> {
         sandbox::reset_persistent_namespaces().context("Failed to persistent namespaces")?;
-        rootfs::reset(
-            self.rootfs_state.as_mut().context("Did not join a core")?,
-            &self.quotas,
-        )
-        .context("Failed to reset rootfs")?;
+        rootfs::reset(self.rootfs_state.as_mut().context("Did not join a core")?)
+            .context("Failed to reset rootfs")?;
 
         self.run_reaper_command(reaper::Command::Reset)?;
+        Ok(())
+    }
+
+    pub fn commit(&mut self) -> Result<()> {
+        rootfs::commit(self.rootfs_state.as_mut().context("Did not join a core")?)
+            .context("Failed to commit rootfs")?;
         Ok(())
     }
 
     pub fn bind(&mut self, external: &str, internal: &str, ro: bool) -> Result<()> {
         let internal_abs = rootfs::resolve_abs_box_root(internal)?;
         system::bind_mount(rootfs::resolve_abs_old_root(external)?, &internal_abs)?;
-        system::change_propagation(internal_abs, system::MS_PRIVATE)?; // linux@d29216842a85
+        system::change_propagation(&internal_abs, system::MS_PRIVATE)?; // linux@d29216842a85
         if ro {
+            system::remount_readonly(&internal_abs)
+                .with_context(|| format!("Failed to remount {internal_abs:?} read-only"))?;
             self.run_manager_command(manager::Command::RemountReadonly {
                 path: internal.to_string(),
             })?;
