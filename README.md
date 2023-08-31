@@ -20,6 +20,8 @@ Finally, sandboxes seldom prioritize efficiency. We can do much better than recr
 
 ## Building
 
+sunwalker-box supports x86-64 (AMD64) and aarch64 (ARM64) architectures and requires Linux 5.19+ on x86-64 and Linux 6.2+ on aarch64.
+
 ### 🐳 With Docker (recommended)
 
 The only thing you need to have installed is Docker. After run, `sunwalker_box` X86_64 binary appears in root folder.
@@ -31,11 +33,24 @@ The executable is statically linked, so it can be copied to any Linux machine an
 
 ### Manually
 
-Install rustc nightly, `nasm`, `ld`, and `gem install seccomp-tools`, and use
+You will need to install the following dependencies:
 
+- Rust, with toolchain `nightly-<architecture>-unknown-linux-gnu` and target `<target>-unknown-linux-musl`
+- GNU make
+- GCC
+- binutils
+- `musl-gcc`, provided on Ubuntu by `musl-tools`
+- `gem`, provided on Ubuntu by `ruby-rubygems`
+- Ruby headers, provided on Ubuntu by `ruby-dev`
+- `seccomp-tools`, provided by `gem install seccomp-tools`
+- (aarch64 only) Linux headers, provided on Ubuntu by `linux-headers-$(uname -r)`
+
+To build sunwalker-box, use:
 ```shell
 $ make sunwalker-box
 ```
+
+Cross-compilation for x86-64 is supported by passing `ARCH=x86-64` to `make`. For aarch64, sunwalker-box should be built natively on the target machine, as it includes a kernel module.
 
 
 ## Using

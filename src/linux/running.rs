@@ -1,6 +1,6 @@
 use crate::linux::{cgroups, ipc, rootfs, timens, tracing, userns};
 use anyhow::{bail, Context, Result};
-use multiprocessing::Object;
+use crossmist::Object;
 use nix::{
     errno, libc,
     libc::pid_t,
@@ -59,8 +59,6 @@ pub struct RunResults {
 enum ProcessState {
     JustStarted,
     Alive,
-    EmulateSyscall(i64),
-    RedirectSyscall(u64),
 }
 
 struct ProcessInfo {
@@ -73,10 +71,10 @@ struct SingleRun<'a> {
     options: Options,
     results: RunResults,
     box_cgroup: Option<cgroups::BoxCgroup>,
-    has_peak: bool,
     main_pid: Pid,
     start_time: Option<Instant>,
     processes: HashMap<Pid, ProcessInfo>,
+    #[cfg(target_arch = "x86_64")]
     tsc_shift: u64,
     sem_next_id: isize,
     msg_next_id: isize,
@@ -86,8 +84,8 @@ struct SingleRun<'a> {
 impl Runner {
     pub fn new(proc_cgroup: cgroups::ProcCgroup) -> Result<Self> {
         // Mount procfs and enter the sandboxed root
-        rootfs::configure_rootfs().context("Failed to configure rootfs")?;
         let timens_controller = timens::TimeNsController::new().context("Failed to adjust time")?;
+        rootfs::configure_rootfs().context("Failed to configure rootfs")?;
         userns::enter_user_namespace().context("Failed to unshare user namespace")?;
         rootfs::enter_rootfs().context("Failed to enter rootfs")?;
 
@@ -149,10 +147,10 @@ impl Runner {
                 memory: 0,
             },
             box_cgroup: None,
-            has_peak: false,
             main_pid: Pid::from_raw(0),
             start_time: None,
             processes: HashMap::new(),
+            #[cfg(target_arch = "x86_64")]
             tsc_shift: rand::random::<u64>(),
             sem_next_id: 0,
             msg_next_id: 0,
@@ -205,7 +203,7 @@ impl SingleRun<'_> {
         let [stdin, stdout, stderr] = self.open_standard_streams()?;
 
         // Start process, redirecting standard streams and configuring ITIMER_PROF
-        let (theirs, mut ours) = multiprocessing::channel().context("Failed to create a pipe")?;
+        let (theirs, mut ours) = crossmist::channel().context("Failed to create a pipe")?;
         let user_process = executor_worker
             .spawn(
                 self.options.argv.clone(),
@@ -323,21 +321,10 @@ impl SingleRun<'_> {
                 .min(idleness_time_limit - self.results.idleness_time + Duration::from_millis(50));
         }
 
-        // Old kernels don't reveal memory.peak, so the only way to get memory usage stats is to use
-        // polling
-        if !self.has_peak {
-            timeout = Duration::from_millis(50);
-        }
-
         if timeout == Duration::MAX {
             -1
         } else {
-            // Old kernels don't support very large timeouts
-            timeout
-                .as_millis()
-                .try_into()
-                .unwrap_or(i32::MAX)
-                .min(1000000)
+            timeout.as_millis().try_into().unwrap_or(i32::MAX)
         }
     }
 
@@ -450,12 +437,6 @@ impl SingleRun<'_> {
         self.results.cpu_time = cpu_stats.total;
         self.results.real_time = self.start_time.unwrap().elapsed();
         self.results.idleness_time = self.results.real_time.saturating_sub(self.results.cpu_time);
-        if !self.has_peak {
-            self.results.memory = self
-                .results
-                .memory
-                .max(self.box_cgroup.as_mut().unwrap().get_memory_total()?);
-        }
         Ok(())
     }
 
@@ -464,7 +445,7 @@ impl SingleRun<'_> {
         Ok(())
     }
 
-    fn on_after_execve(process: &ProcessInfo) -> Result<()> {
+    fn on_after_execve(process: &mut ProcessInfo) -> Result<()> {
         // Required to make clock_gettime work
         process.traced_process.disable_vdso()?;
         Ok(())
@@ -533,108 +514,18 @@ impl SingleRun<'_> {
                 } as i64);
             }
             libc::SYS_memfd_create => {
-                return Self::emulate_syscall_two_step(process, syscall_info.nr);
-            }
-            _ => {}
-        }
-
-        process.traced_process.resume()?;
-        Ok(())
-    }
-
-    fn emulate_syscall_result_errno(process: &mut ProcessInfo, mut result: i64) -> Result<()> {
-        if result == -1 {
-            result = -errno::errno() as i64;
-        }
-        Self::emulate_syscall_result(process, result)
-    }
-
-    fn emulate_syscall_result(process: &mut ProcessInfo, result: i64) -> Result<()> {
-        let mut regs = process.traced_process.get_registers()?;
-        regs.rax = u64::MAX; // skip syscall
-        process.traced_process.set_registers(regs)?;
-        process.state = ProcessState::EmulateSyscall(result);
-        process.traced_process.resume_step()?;
-        Ok(())
-    }
-
-    fn emulate_syscall_two_step(process: &mut ProcessInfo, syscall_no: u64) -> Result<()> {
-        let mut regs = process.traced_process.get_registers()?;
-        regs.rax = u64::MAX; // skip syscall
-        process.traced_process.set_registers(regs)?;
-        process.state = ProcessState::RedirectSyscall(syscall_no);
-        process.traced_process.resume_step()?;
-        Ok(())
-    }
-
-    fn handle_sigsegv(&self, process: &ProcessInfo) -> Result<()> {
-        let info = process.traced_process.get_signal_info()?;
-        if info.si_signo != signal::Signal::SIGSEGV as i32 {
-            // Excuse me?
-            bail!(
-                "This shouldn't happen: signal number mismatch between waitpid and \
-                 PTRACE_GETSIGINFO"
-            );
-        }
-
-        const SI_KERNEL: i32 = 128;
-        if info.si_code == SI_KERNEL {
-            let fault_address = unsafe { info.si_addr() as usize };
-            if fault_address == 0 {
-                // rdtsc fails with #GP(0)
-                let mut regs = process.traced_process.get_registers()?;
-                if let Ok(word) = process.traced_process.read_word(regs.rip as usize) {
-                    if word & 0xffff == 0x310f {
-                        // rdtsc = 0f 31
-                        regs.rip += 2;
-                        let mut tsc = unsafe { core::arch::x86_64::_rdtsc() };
-                        tsc += self.tsc_shift;
-                        regs.rdx = tsc >> 32;
-                        regs.rax = tsc & 0xffffffff;
-                        process.traced_process.set_registers(regs)?;
-                        process.traced_process.resume()?;
-                        return Ok(());
-                    } else if word & 0xffffff == 0xf9010f {
-                        // rdtscp = 0f 01 f9
-                        regs.rip += 3;
-                        let mut aux = 0;
-                        let mut tsc = unsafe { core::arch::x86_64::__rdtscp(&mut aux) };
-                        tsc += self.tsc_shift;
-                        regs.rdx = tsc >> 32;
-                        regs.rax = tsc & 0xffffffff;
-                        regs.rcx = aux as u64;
-                        process.traced_process.set_registers(regs)?;
-                        process.traced_process.resume()?;
-                        return Ok(());
-                    }
-                }
-            }
-        }
-
-        process
-            .traced_process
-            .resume_signal(signal::Signal::SIGSEGV)?;
-        Ok(())
-    }
-
-    fn redirect_syscall(&mut self, pid: Pid, syscall_no: i64) -> Result<()> {
-        match syscall_no {
-            libc::SYS_memfd_create => {
-                let process = self.processes.get_mut(&pid).unwrap();
-                let mut regs = process.traced_process.get_registers()?;
-
-                let res: std::io::Result<()> = try {
+                return Self::emulate_syscall_redirect(process, |process| {
                     let mut name = process
                         .traced_process
-                        .read_cstring(regs.rdi as usize, 249)?
+                        .read_cstring(syscall_info.args[0] as usize, 249)?
                         .into_bytes_with_nul();
 
                     let mut open_flags = libc::O_RDWR | libc::O_CREAT;
-                    if regs.rsi & (libc::MFD_CLOEXEC as u64) != 0 {
+                    if syscall_info.args[1] & (libc::MFD_CLOEXEC as u64) != 0 {
                         open_flags |= libc::O_CLOEXEC;
                     }
                     // TODO: sealing
-                    if regs.rsi
+                    if syscall_info.args[1]
                         & !(libc::MFD_CLOEXEC
                             | libc::MFD_HUGETLB
                             | (libc::MFD_HUGE_MASK << libc::MFD_HUGE_SHIFT))
@@ -651,31 +542,171 @@ impl SingleRun<'_> {
                         format!("/dev/shm/memfd:{:08x}:", rand::random::<u32>()).into_bytes();
                     file_name.append(&mut name);
 
-                    let file_name_addr = (regs.rsp - 128) as usize - file_name.len();
+                    let file_name_addr = (process.traced_process.get_stack_pointer()? - 128)
+                        as usize
+                        - file_name.len();
 
                     process
                         .traced_process
                         .write_memory(file_name_addr, &file_name)?;
 
-                    regs.rip -= 2;
-                    regs.rax = libc::SYS_open as u64;
-                    regs.rdi = file_name_addr as u64;
-                    regs.rsi = open_flags as u64;
-                    regs.rdx = 0o700;
-                };
-
-                if let Err(err) = res {
-                    regs.rax = -err.raw_os_error().unwrap() as u64;
-                }
-
-                process.traced_process.set_registers(regs)?;
-                process.state = ProcessState::Alive;
-                process.traced_process.resume()?;
+                    Ok((
+                        libc::SYS_openat as i32,
+                        [
+                            libc::AT_FDCWD as usize,
+                            file_name_addr,
+                            open_flags as usize,
+                            0o700,
+                        ],
+                    ))
+                });
             }
-
-            _ => bail!("Unexpected redirected syscall {syscall_no}"),
+            _ => {}
         }
 
+        process.traced_process.resume()?;
+        Ok(())
+    }
+
+    fn emulate_syscall_result_errno(process: &mut ProcessInfo, mut result: i64) -> Result<()> {
+        if result == -1 {
+            result = -errno::errno() as i64;
+        }
+        Self::emulate_syscall_result(process, result)
+    }
+
+    fn emulate_syscall_result(process: &mut ProcessInfo, result: i64) -> Result<()> {
+        process.traced_process.set_syscall_result(result as usize)?;
+        process.traced_process.set_syscall_no(-1)?; // skip syscall
+        process.state = ProcessState::Alive;
+        process.traced_process.resume()?;
+        Ok(())
+    }
+
+    fn emulate_syscall_redirect<const N: usize>(
+        process: &mut ProcessInfo,
+        redirect: impl FnOnce(&mut ProcessInfo) -> std::io::Result<(i32, [usize; N])>,
+    ) -> Result<()> {
+        match redirect(process) {
+            Ok((syscall_no, args)) => {
+                process.traced_process.set_syscall_no(syscall_no)?;
+                for i in 0..N {
+                    process.traced_process.set_syscall_arg(i, args[i])?;
+                }
+            }
+            Err(err) => {
+                process.traced_process.set_syscall_no(-1)?; // skip syscall
+                process
+                    .traced_process
+                    .set_syscall_result(-err.raw_os_error().unwrap_or(libc::EINVAL) as usize)?;
+            }
+        }
+        process.state = ProcessState::Alive;
+        process.traced_process.resume()?;
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn handle_sigsegv(&mut self, pid: Pid) -> Result<()> {
+        let process = self
+            .processes
+            .get(&pid)
+            .with_context(|| format!("Unknown pid {pid}"))?;
+
+        let info = process.traced_process.get_signal_info()?;
+        if info.si_signo != signal::Signal::SIGSEGV as i32 {
+            // Excuse me?
+            bail!(
+                "This shouldn't happen: signal number mismatch between waitpid and \
+                 PTRACE_GETSIGINFO"
+            );
+        }
+
+        const SI_KERNEL: i32 = 128;
+        if info.si_code == SI_KERNEL {
+            let fault_address = unsafe { info.si_addr() as usize };
+            if fault_address == 0 {
+                if self.emulate_insn(pid)? {
+                    return Ok(());
+                }
+            }
+        }
+
+        let process = self.processes.get_mut(&pid).unwrap();
+        process
+            .traced_process
+            .resume_signal(signal::Signal::SIGSEGV)?;
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn handle_sigill(&mut self, pid: Pid) -> Result<()> {
+        if !self.emulate_insn(pid)? {
+            let process = self.processes.get_mut(&pid).unwrap();
+            process
+                .traced_process
+                .resume_signal(signal::Signal::SIGILL)?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn emulate_insn(&mut self, pid: Pid) -> Result<bool> {
+        let process = self.processes.get_mut(&pid).unwrap();
+
+        let mut regs = process.traced_process.get_registers()?;
+        let Ok(word) = process.traced_process.read_word(regs.rip as usize) else {
+            return Ok(false);
+        };
+
+        if word & 0xffff == 0x310f {
+            // rdtsc = 0f 31
+            regs.rip += 2;
+            let mut tsc = unsafe { core::arch::x86_64::_rdtsc() };
+            tsc += self.tsc_shift;
+            regs.rdx = tsc >> 32;
+            regs.rax = tsc & 0xffffffff;
+            process.traced_process.set_registers(regs);
+            process.traced_process.resume()?;
+            Ok(true)
+        } else if word & 0xffffff == 0xf9010f {
+            // rdtscp = 0f 01 f9
+            regs.rip += 3;
+            let mut tsc = unsafe { core::arch::x86_64::_rdtsc() };
+            tsc += self.tsc_shift;
+            regs.rdx = tsc >> 32;
+            regs.rax = tsc & 0xffffffff;
+            regs.rcx = 1;
+            process.traced_process.set_registers(regs);
+            process.traced_process.resume()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn handle_sigsegv(&mut self, pid: Pid) -> Result<()> {
+        let process = self
+            .processes
+            .get_mut(&pid)
+            .with_context(|| format!("Unknown pid {pid}"))?;
+        process
+            .traced_process
+            .resume_signal(signal::Signal::SIGSEGV)?;
+        Ok(())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn handle_sigill(&mut self, pid: Pid) -> Result<()> {
+        let process = self
+            .processes
+            .get_mut(&pid)
+            .with_context(|| format!("Unknown pid {pid}"))?;
+        process
+            .traced_process
+            .resume_signal(signal::Signal::SIGILL)?;
         Ok(())
     }
 
@@ -692,37 +723,24 @@ impl SingleRun<'_> {
             wait::WaitStatus::Stopped(pid, signal) => {
                 let process = self
                     .processes
-                    .get(&pid)
+                    .get_mut(&pid)
                     .with_context(|| format!("Unknown pid {pid}"))?;
 
                 match signal {
                     signal::Signal::SIGSTOP => {
                         if process.state == ProcessState::JustStarted {
-                            let process = self.processes.get_mut(&pid).unwrap();
                             process.state = ProcessState::Alive;
                             Self::on_after_fork(process)?;
                             process.traced_process.resume()?;
                             return Ok(false);
                         }
                     }
-                    signal::Signal::SIGTRAP => match process.state {
-                        ProcessState::EmulateSyscall(ret) => {
-                            let process = self.processes.get_mut(&pid).unwrap();
-                            process.state = ProcessState::Alive;
-                            let mut regs = process.traced_process.get_registers()?;
-                            regs.rax = ret as u64;
-                            process.traced_process.set_registers(regs)?;
-                            process.traced_process.resume()?;
-                            return Ok(false);
-                        }
-                        ProcessState::RedirectSyscall(syscall_no) => {
-                            self.redirect_syscall(pid, syscall_no as i64)?;
-                            return Ok(false);
-                        }
-                        _ => {}
-                    },
                     signal::Signal::SIGSEGV => {
-                        self.handle_sigsegv(process)?;
+                        self.handle_sigsegv(pid)?;
+                        return Ok(false);
+                    }
+                    signal::Signal::SIGILL => {
+                        self.handle_sigill(pid)?;
                         return Ok(false);
                     }
                     _ => {}
@@ -734,14 +752,14 @@ impl SingleRun<'_> {
             wait::WaitStatus::PtraceEvent(pid, _, event) => {
                 match event {
                     libc::PTRACE_EVENT_EXEC => {
-                        let process = ProcessInfo {
+                        let mut process = ProcessInfo {
                             state: ProcessState::Alive,
                             traced_process: tracing::TracedProcess::new(pid)?,
                         };
                         let old_pid =
                             Pid::from_raw(process.traced_process.get_event_msg()? as pid_t);
                         self.processes.remove(&old_pid);
-                        Self::on_after_execve(&process)?;
+                        Self::on_after_execve(&mut process)?;
                         process.traced_process.resume()?;
                         self.processes.insert(pid, process);
                         return Ok(false);
@@ -755,7 +773,7 @@ impl SingleRun<'_> {
 
                 let process = self
                     .processes
-                    .get(&pid)
+                    .get_mut(&pid)
                     .with_context(|| format!("Unknown pid {pid}"))?;
 
                 match event {
@@ -853,13 +871,6 @@ impl SingleRun<'_> {
 
         let traced_process = self.start_worker()?;
 
-        self.has_peak = self
-            .box_cgroup
-            .as_mut()
-            .unwrap()
-            .get_memory_peak()?
-            .is_some();
-
         // execve has just happened
         self.start_time = Some(Instant::now());
 
@@ -870,7 +881,7 @@ impl SingleRun<'_> {
                 traced_process,
             },
         );
-        let main_process = self.processes.get(&self.main_pid).unwrap();
+        let main_process = self.processes.get_mut(&self.main_pid).unwrap();
 
         Self::on_after_fork(main_process)?;
         Self::on_after_execve(main_process)?;
@@ -885,16 +896,7 @@ impl SingleRun<'_> {
             self.update_metrics()?;
         }
 
-        if self.has_peak {
-            self.results.memory = self.results.memory.max(
-                self.box_cgroup
-                    .as_mut()
-                    .unwrap()
-                    .get_memory_peak()?
-                    .context("memory.peak is unexpectedly unavailable")?,
-            );
-        }
-
+        self.results.memory = self.box_cgroup.as_mut().unwrap().get_memory_peak()?;
         self.results.verdict = self.compute_verdict(wait_status)?;
 
         self.cleanup()?;
@@ -903,14 +905,14 @@ impl SingleRun<'_> {
     }
 }
 
-#[multiprocessing::func]
+#[crossmist::func]
 fn executor_worker(
     argv: Vec<String>,
     env: Option<HashMap<String, String>>,
     stdin: File,
     stdout: File,
     stderr: File,
-    mut pipe: multiprocessing::Sender<String>,
+    mut pipe: crossmist::Sender<String>,
     cpu_time_limit: Option<Duration>,
     exec_wrapper: File,
 ) {

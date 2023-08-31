@@ -1,10 +1,8 @@
 #![feature(
     file_create_new,
     io_error_more,
-    is_some_and,
     never_type,
     try_blocks,
-    unix_chown,
     unwrap_infallible
 )]
 
@@ -17,8 +15,10 @@ mod linux {
     pub mod entry;
     mod ids;
     mod ipc;
+    mod kmodule;
     mod manager;
     mod mountns;
+    mod openat;
     mod procs;
     mod reaper;
     mod rootfs;
